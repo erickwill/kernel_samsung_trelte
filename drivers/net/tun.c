@@ -68,6 +68,19 @@
 #include <net/netns/generic.h>
 #include <net/rtnetlink.h>
 #include <net/sock.h>
+// ------------- START of KNOX_VPN ------------------//
+#include <linux/types.h>
+#include <linux/udp.h>
+#include <linux/tcp.h>
+#include <linux/ip.h>
+#include <net/ip.h>
+
+#define META_MARK_BASE_LOWER 100
+#define META_UID_PID_MARK_BASE_LOWER 150
+#define META_UID_PID_MARK_BASE_UPPER 199
+#define META_MARK_BASE_UPPER 500
+
+// ------------- END of KNOX_VPN -------------------//
 
 #include <asm/uaccess.h>
 
@@ -100,6 +113,27 @@ do {								\
 } while (0)
 #endif
 
+// ------------- START of KNOX_VPN ------------------//
+/* The KNOX framework marks packets intended to a VPN client for special processing differently.
+ * The marked packets hit special IP table rules and are routed back to user space using the TUN driver
+ * for policy based treatment by the VPN client.
+ * Some VPN clients can make more intelligent decisions based on the UID/PID information.
+ * For such clients, we mark packets to be in the range >= META_MARK_BASE_LOWER and < META_MARK_BASE_UPPER.
+ * When such packets are seen, we update the IP headers to carry UID/PID information
+ * in the IP options - all other packets are ignored.
+ * Also, see the comments above the individual steps taken in the code for details
+ */
+
+/* Metadata header structure */
+
+struct knox_meta_param {
+    uid_t uid;
+    pid_t pid;
+};
+
+#define TUN_META_HDR_SZ sizeof(struct knox_meta_param)
+#define TUN_META_MARK_OFFSET offsetof(struct knox_meta_param, uid)
+// ------------- END of KNOX_VPN -------------------//
 #define GOODCOPY_LEN 128
 
 #define FLT_EXACT_COUNT 8
@@ -1037,6 +1071,29 @@ static int zerocopy_sg_from_iovec(struct sk_buff *skb, const struct iovec *from,
 	return 0;
 }
 
+static unsigned long iov_pages(const struct iovec *iv, int offset,
+			       unsigned long nr_segs)
+{
+	unsigned long seg, base;
+	int pages = 0, len, size;
+
+	while (nr_segs && (offset >= iv->iov_len)) {
+		offset -= iv->iov_len;
+		++iv;
+		--nr_segs;
+	}
+
+	for (seg = 0; seg < nr_segs; seg++) {
+		base = (unsigned long)iv[seg].iov_base + offset;
+		len = iv[seg].iov_len - offset;
+		size = ((base & ~PAGE_MASK) + len + ~PAGE_MASK) >> PAGE_SHIFT;
+		pages += size;
+		offset = 0;
+	}
+
+	return pages;
+}
+
 /* Get packet from user space buffer */
 static ssize_t tun_get_user(struct tun_struct *tun, struct tun_file *tfile,
 			    void *msg_control, const struct iovec *iv,
@@ -1044,8 +1101,9 @@ static ssize_t tun_get_user(struct tun_struct *tun, struct tun_file *tfile,
 {
 	struct tun_pi pi = { 0, cpu_to_be16(ETH_P_IP) };
 	struct sk_buff *skb;
-	size_t len = total_len, align = NET_SKB_PAD;
+	size_t len = total_len, align = NET_SKB_PAD, linear;
 	struct virtio_net_hdr gso = { 0 };
+	int good_linear;
 	int offset = 0;
 	int copylen;
 	bool zerocopy = false;
@@ -1053,8 +1111,9 @@ static ssize_t tun_get_user(struct tun_struct *tun, struct tun_file *tfile,
 	u32 rxhash;
 
 	if (!(tun->flags & TUN_NO_PI)) {
-		if ((len -= sizeof(pi)) > total_len)
+		if (len < sizeof(pi))
 			return -EINVAL;
+		len -= sizeof(pi);
 
 		if (memcpy_fromiovecend((void *)&pi, iv, 0, sizeof(pi)))
 			return -EFAULT;
@@ -1062,8 +1121,9 @@ static ssize_t tun_get_user(struct tun_struct *tun, struct tun_file *tfile,
 	}
 
 	if (tun->flags & TUN_VNET_HDR) {
-		if ((len -= tun->vnet_hdr_sz) > total_len)
+		if (len < tun->vnet_hdr_sz)
 			return -EINVAL;
+		len -= tun->vnet_hdr_sz;
 
 		if (memcpy_fromiovecend((void *)&gso, iv, offset, sizeof(gso)))
 			return -EFAULT;
@@ -1084,34 +1144,30 @@ static ssize_t tun_get_user(struct tun_struct *tun, struct tun_file *tfile,
 			return -EINVAL;
 	}
 
-	if (msg_control)
-		zerocopy = true;
+	good_linear = SKB_MAX_HEAD(align);
 
-	if (zerocopy) {
-		/* Userspace may produce vectors with count greater than
-		 * MAX_SKB_FRAGS, so we need to linearize parts of the skb
-		 * to let the rest of data to be fit in the frags.
-		 */
-		if (count > MAX_SKB_FRAGS) {
-			copylen = iov_length(iv, count - MAX_SKB_FRAGS);
-			if (copylen < offset)
-				copylen = 0;
-			else
-				copylen -= offset;
-		} else
-				copylen = 0;
-		/* There are 256 bytes to be copied in skb, so there is enough
-		 * room for skb expand head in case it is used.
+	if (msg_control) {
+		/* There are 256 bytes to be copied in skb, so there is
+		 * enough room for skb expand head in case it is used.
 		 * The rest of the buffer is mapped from userspace.
 		 */
-		if (copylen < gso.hdr_len)
-			copylen = gso.hdr_len;
-		if (!copylen)
-			copylen = GOODCOPY_LEN;
-	} else
-		copylen = len;
+		copylen = gso.hdr_len ? gso.hdr_len : GOODCOPY_LEN;
+		if (copylen > good_linear)
+			copylen = good_linear;
+		linear = copylen;
+		if (iov_pages(iv, offset + copylen, count) <= MAX_SKB_FRAGS)
+			zerocopy = true;
+	}
 
-	skb = tun_alloc_skb(tfile, align, copylen, gso.hdr_len, noblock);
+	if (!zerocopy) {
+		copylen = len;
+		if (gso.hdr_len > good_linear)
+			linear = good_linear;
+		else
+			linear = gso.hdr_len;
+	}
+
+	skb = tun_alloc_skb(tfile, align, copylen, linear, noblock);
 	if (IS_ERR(skb)) {
 		if (PTR_ERR(skb) != -EAGAIN)
 			tun->dev->stats.rx_dropped++;
@@ -1120,8 +1176,13 @@ static ssize_t tun_get_user(struct tun_struct *tun, struct tun_file *tfile,
 
 	if (zerocopy)
 		err = zerocopy_sg_from_iovec(skb, iv, offset, count);
-	else
+	else {
 		err = skb_copy_datagram_from_iovec(skb, 0, iv, offset, len);
+		if (!err && msg_control) {
+			struct ubuf_info *uarg = msg_control;
+			uarg->callback(uarg, false);
+		}
+	}
 
 	if (err) {
 		tun->dev->stats.rx_dropped++;
@@ -1237,6 +1298,54 @@ static ssize_t tun_chr_aio_write(struct kiocb *iocb, const struct iovec *iv,
 	return result;
 }
 
+
+// ------------- START of KNOX_VPN ------------------//
+
+/* KNOX VPN packets have extra bytes because they carry meta information by default 
+     * Such packets have sizeof(struct tun_meta_header) extra bytes in the IP options
+     * This automatically reflects in the IP header length (IHL)
+     */
+static int knoxvpn_tun_uidpid(struct tun_struct *tun, struct sk_buff *skb, const struct iovec *iv, int* len, ssize_t* total)
+{
+    struct skb_shared_info * temp = NULL;
+	struct knox_meta_param metalocal = {0,0};
+
+	if(skb != NULL){
+		temp = skb_shinfo(skb);
+	}
+
+    if ( (tun->flags & TUN_META_HDR) == 0 || skb == NULL || temp == NULL || temp->knox_mark < META_UID_PID_MARK_BASE_LOWER || META_UID_PID_MARK_BASE_UPPER < temp->knox_mark ){
+        metalocal.uid = 0;
+        metalocal.pid = 0;
+
+    }
+    else{
+        metalocal.uid = temp->uid;
+        metalocal.pid = temp->pid;
+    }
+    
+    if(temp!=NULL){
+        temp->uid = 0;
+        temp->pid = 0;
+    }
+
+    if (tun->flags & TUN_META_HDR) {
+#ifdef TUN_DEBUG
+        pr_err("KNOX: Appending uid: %d and pid: %d", metalocal.uid, metalocal.pid);
+#endif
+        if (unlikely(memcpy_toiovecend(iv, (void *)&metalocal, (*total), sizeof(struct knox_meta_param)))) {
+            return -1;
+        }			
+        (*total) += TUN_META_HDR_SZ;
+    }
+
+    return 0;
+
+}
+
+// ------------- END of KNOX_VPN ------------------//
+
+
 /* Put packet to the user space buffer */
 static ssize_t tun_put_user(struct tun_struct *tun,
 			    struct tun_file *tfile,
@@ -1307,6 +1416,13 @@ static ssize_t tun_put_user(struct tun_struct *tun,
 			return -EFAULT;
 		total += tun->vnet_hdr_sz;
 	}
+
+
+// ------------- START of KNOX_VPN ------------------//
+	if( knoxvpn_tun_uidpid(tun, skb, iv, &len, &total) < 0 ){
+		return -EINVAL;
+	}
+// ------------- END of KNOX_VPN ------------------//
 
 	len = min_t(int, skb->len, len);
 
@@ -1385,6 +1501,8 @@ static ssize_t tun_chr_aio_read(struct kiocb *iocb, const struct iovec *iv,
 	ret = tun_do_read(tun, tfile, iocb, iv, len,
 			  file->f_flags & O_NONBLOCK);
 	ret = min_t(ssize_t, ret, len);
+	if (ret > 0)
+		iocb->ki_pos = ret;
 out:
 	tun_put(tun);
 	return ret;
@@ -1511,6 +1629,15 @@ static struct proto tun_proto = {
 static int tun_flags(struct tun_struct *tun)
 {
 	int flags = 0;
+
+// ------------- START of KNOX_VPN ------------------//
+	/* Checks if meta header is enabled so that 
+	 * packets will be prepended with meta data(UID/PID)
+	 */
+	if (tun->flags & TUN_META_HDR) {
+		flags |= IFF_META_HDR;		
+	}	
+// ------------- END of KNOX_VPN -------------------//
 
 	if (tun->flags & TUN_TUN_DEV)
 		flags |= IFF_TUN;
@@ -1674,11 +1801,11 @@ static int tun_set_iff(struct net *net, struct file *file, struct ifreq *ifr)
 		INIT_LIST_HEAD(&tun->disabled);
 		err = tun_attach(tun, file);
 		if (err < 0)
-			goto err_free_dev;
+			goto err_free_flow;
 
 		err = register_netdevice(tun->dev);
 		if (err < 0)
-			goto err_free_dev;
+			goto err_detach;
 
 		if (device_create_file(&tun->dev->dev, &dev_attr_tun_flags) ||
 		    device_create_file(&tun->dev->dev, &dev_attr_owner) ||
@@ -1689,6 +1816,13 @@ static int tun_set_iff(struct net *net, struct file *file, struct ifreq *ifr)
 	netif_carrier_on(tun->dev);
 
 	tun_debug(KERN_INFO, tun, "tun_set_iff\n");
+// ------------- START of KNOX_VPN ------------------//
+	if (ifr->ifr_flags & IFF_META_HDR) {
+		tun->flags |= TUN_META_HDR;
+	} else {
+		tun->flags &= ~TUN_META_HDR;
+	}
+// ------------- END of KNOX_VPN -------------------//
 
 	if (ifr->ifr_flags & IFF_NO_PI)
 		tun->flags |= TUN_NO_PI;
@@ -1722,7 +1856,12 @@ static int tun_set_iff(struct net *net, struct file *file, struct ifreq *ifr)
 	strcpy(ifr->ifr_name, tun->dev->name);
 	return 0;
 
- err_free_dev:
+err_detach:
+	tun_detach_all(dev);
+err_free_flow:
+	tun_flow_uninit(tun);
+	security_tun_dev_free_security(tun->security);
+err_free_dev:
 	free_netdev(dev);
 	return err;
 }
@@ -1863,6 +2002,17 @@ static long __tun_chr_ioctl(struct file *file, unsigned int cmd,
 	int sndbuf;
 	int vnet_hdr_sz;
 	int ret;
+// ------------- START of KNOX_VPN ------------------//
+	int knox_flag = 0;
+	int tun_meta_param;
+	int tun_meta_value;
+// ------------- END of KNOX_VPN -------------------//
+
+#ifdef CONFIG_ANDROID_PARANOID_NETWORK
+	if (cmd != TUNGETIFF && !capable(CAP_NET_ADMIN)) {
+		return -EPERM;
+	}
+#endif
 
 	if (cmd == TUNSETIFF || cmd == TUNSETQUEUE || _IOC_TYPE(cmd) == 0x89) {
 		if (copy_from_user(&ifr, argp, ifreq_len))
@@ -1874,9 +2024,13 @@ static long __tun_chr_ioctl(struct file *file, unsigned int cmd,
 		/* Currently this just means: "what IFF flags are valid?".
 		 * This is needed because we never checked for invalid flags on
 		 * TUNSETIFF. */
+
+// ------------- START of KNOX_VPN ------------------//
+		knox_flag |= IFF_META_HDR;
 		return put_user(IFF_TUN | IFF_TAP | IFF_NO_PI | IFF_ONE_QUEUE |
-				IFF_VNET_HDR | IFF_MULTI_QUEUE,
+				IFF_VNET_HDR | IFF_MULTI_QUEUE | knox_flag,
 				(unsigned int __user*)argp);
+// ------------- END of KNOX_VPN -------------------//
 	} else if (cmd == TUNSETQUEUE)
 		return tun_set_queue(file, &ifr);
 
@@ -2042,6 +2196,37 @@ static long __tun_chr_ioctl(struct file *file, unsigned int cmd,
 
 		tun->vnet_hdr_sz = vnet_hdr_sz;
 		break;
+
+// ------------- START of KNOX_VPN ------------------//
+	case TUNGETMETAPARAM:
+		if (copy_from_user(&tun_meta_param, argp,
+				   sizeof(tun_meta_param))) {
+			ret = -EFAULT;
+			break;
+		}
+
+		ret = 0;
+		switch (tun_meta_param) {
+		case TUN_GET_META_HDR_SZ:
+			tun_meta_value = TUN_META_HDR_SZ;
+			break;
+
+		case TUN_GET_META_MARK_OFFSET:
+			tun_meta_value = TUN_META_MARK_OFFSET;
+			break;
+
+		default:
+			ret = -EINVAL;
+			break;
+		}
+
+		if (!ret) {
+			if (copy_to_user(argp, &tun_meta_value,
+					 sizeof(tun_meta_value)))
+				ret = -EFAULT;
+		} 			
+		break;
+// ------------- END of KNOX_VPN -------------------//
 
 	case TUNATTACHFILTER:
 		/* Can be set only for TAPs */

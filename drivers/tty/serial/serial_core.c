@@ -37,6 +37,14 @@
 #include <asm/irq.h>
 #include <asm/uaccess.h>
 
+#if defined(CONFIG_BT_BCM4339) || defined(CONFIG_BT_BCM4354) || defined(CONFIG_BT_BCM4358) /* This is just temporary features*/
+#if defined(CONFIG_SOC_EXYNOS5430) || defined(CONFIG_SOC_EXYNOS5433)
+#define BT4339_LINE 3
+#else
+#define BT4339_LINE 0
+#endif
+#endif
+
 /*
  * This is used to lock changes in serial line configuration.
  */
@@ -94,6 +102,9 @@ static void __uart_start(struct tty_struct *tty)
 {
 	struct uart_state *state = tty->driver_data;
 	struct uart_port *port = state->uart_port;
+
+	if (port->ops->wake_peer)
+		port->ops->wake_peer(port);
 
 	if (!uart_circ_empty(&state->xmit) && state->xmit.buf &&
 	    !tty->stopped && !tty->hw_stopped)
@@ -180,7 +191,12 @@ static int uart_port_startup(struct tty_struct *tty, struct uart_state *state,
 		if (tty_port_cts_enabled(port)) {
 			spin_lock_irq(&uport->lock);
 			if (!(uport->ops->get_mctrl(uport) & TIOCM_CTS))
+#if defined(CONFIG_BT_BCM4339) || defined(CONFIG_BT_BCM4354) || defined(CONFIG_BT_BCM4358)
+				if (uport->line != BT4339_LINE)
 				tty->hw_stopped = 1;
+#else
+				tty->hw_stopped = 1;
+#endif
 			spin_unlock_irq(&uport->lock);
 		}
 	}
@@ -241,6 +257,9 @@ static void uart_shutdown(struct tty_struct *tty, struct uart_state *state)
 		/*
 		 * Turn off DTR and RTS early.
 		 */
+		if (uart_console(uport) && tty)
+			uport->cons->cflag = tty->termios.c_cflag;
+
 		if (!tty || (tty->termios.c_cflag & HUPCL))
 			uart_clear_mctrl(uport, TIOCM_DTR | TIOCM_RTS);
 
@@ -356,7 +375,7 @@ uart_get_baud_rate(struct uart_port *port, struct ktermios *termios,
 		 * The spd_hi, spd_vhi, spd_shi, spd_warp kludge...
 		 * Die! Die! Die!
 		 */
-		if (baud == 38400)
+		if (try == 0 && baud == 38400)
 			baud = altbaud;
 
 		/*
@@ -1299,7 +1318,12 @@ static void uart_set_termios(struct tty_struct *tty,
 	else if (!(old_termios->c_cflag & CRTSCTS) && (cflag & CRTSCTS)) {
 		spin_lock_irqsave(&uport->lock, flags);
 		if (!(uport->ops->get_mctrl(uport) & TIOCM_CTS)) {
+#if defined(CONFIG_BT_BCM4339) || defined(CONFIG_BT_BCM4354) || defined(CONFIG_BT_BCM4358)
+			if (uport->line != BT4339_LINE)
+				tty->hw_stopped = 1;
+#else
 			tty->hw_stopped = 1;
+#endif
 			uport->ops->stop_tx(uport);
 		}
 		spin_unlock_irqrestore(&uport->lock, flags);
@@ -2044,7 +2068,9 @@ int uart_resume_port(struct uart_driver *drv, struct uart_port *uport)
 
 		uart_change_pm(state, UART_PM_STATE_ON);
 		spin_lock_irq(&uport->lock);
+#if !defined(CONFIG_GPS_BCMxxxxx)
 		ops->set_mctrl(uport, 0);
+#endif
 		spin_unlock_irq(&uport->lock);
 		if (console_suspend_enabled || !uart_console(uport)) {
 			/* Protected by port mutex for now */
